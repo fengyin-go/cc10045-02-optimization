@@ -1,18 +1,21 @@
-"""数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
+"""分析管线路由：事件采集、聚合执行、指标快照、告警判定、异常归因等入口。"""
 from __future__ import annotations
 
 from fastapi import APIRouter
+from pydantic import BaseModel, Field
 
 from app.database import db
-from app.pipeline import (
-    check_alert, compute_aggregation, compute_cohort_comparison,
-    compute_forecast, compute_funnel, compute_metric_snapshot,
-    compute_retention, compute_segment, generate_report,
-    ingest_events, precompute_cube, seed_real_data,
-)
+from app.pipeline import seed_real_data
 from app.services import service_for
 
 router = APIRouter(prefix="/api/pipeline", tags=["分析管线"])
+
+
+class AlertCheckPayload(BaseModel):
+    as_of: str | None = Field(
+        default=None,
+        description="以哪个采样时刻为检查截止点；更晚的采样不参与本次判定。",
+    )
 
 
 @router.post("/seed")
@@ -109,10 +112,10 @@ def api_generate_report(report_id: int) -> dict:
 
 
 @router.post("/alerts/check-all")
-def api_check_all_alerts() -> dict:
-    """检查所有已生效告警规则。"""
+def api_check_all_alerts(payload: AlertCheckPayload | None = None) -> dict:
+    """检查所有已生效告警规则（单条规则的详细判定见 /api/alert_policy/{id}/check）。"""
     svc = service_for("alert_policy")
-    return svc.check_all()
+    return svc.check_all(as_of=(payload.as_of if payload else None))
 
 
 @router.get("/analytics/full-pipeline")

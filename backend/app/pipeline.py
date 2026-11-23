@@ -209,13 +209,24 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
 
     从 aggregation_results 或 events 表提取数据，按口径版本计算指标值，
     并与上一期基准值做对比，标记异常（|z-score| > 3）。
+
+    快照同时记录 ``sample_time``（该采样的业务时刻）和 ``ingested_at``
+    （写入时刻）：迟到补报时两者不同，下游告警按 ``sample_time`` 判定连续。
     """
     metric_id = metric["id"]
     metric_name = metric["metric_name"]
     metric_type = metric.get("metric_type", "counter")
     cal_version = metric.get("calibration_version", 1)
 
-    now_str = db.now()
+    ingested_at = db.now()
+    sample_time = str(metric.get("快照时间") or metric.get("sample_time") or ingested_at)
+    source = str(metric.get("sample_source") or "live")
+    # 采样时刻统一成 ISO 秒级格式，保证同一样本的不同写法只算一次
+    from app.alerting import format_time, parse_time
+
+    parsed_sample_time = parse_time(sample_time)
+    if parsed_sample_time is not None:
+        sample_time = format_time(parsed_sample_time)
 
     # 计算当前值
     if metric_type == "counter":
@@ -229,10 +240,12 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
     else:
         current_value = 0.0
 
-    # 获取上一期基准值
+    # 获取上一期基准值：只取同一口径、采样时刻在本次之前的记录
     baseline = db.fetchone(
-        "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-        [metric_id],
+        "SELECT snapshot_value FROM metric_values WHERE metric_id=? "
+        "AND calibration_version=? AND sample_time < ? "
+        "ORDER BY sample_time DESC LIMIT 1",
+        [metric_id, cal_version, sample_time],
     )
     baseline_value = baseline["snapshot_value"] if baseline else None
 
@@ -241,8 +254,10 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
     comparison_status = "已保存"
     if baseline_value is not None and baseline_value != 0:
         historical = db.fetchall(
-            "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 30",
-            [metric_id],
+            "SELECT snapshot_value FROM metric_values WHERE metric_id=? "
+            "AND calibration_version=? AND sample_time < ? "
+            "ORDER BY sample_time DESC LIMIT 30",
+            [metric_id, cal_version, sample_time],
         )
         values = [r["snapshot_value"] for r in historical]
         if len(values) >= 5:
@@ -256,7 +271,10 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
     insert_id = db.insert("metric_values", {
         "metric_id": metric_id,
         "snapshot_value": round(current_value, 4),
-        "snapshot_time": now_str,
+        "snapshot_time": sample_time,
+        "sample_time": sample_time,
+        "ingested_at": ingested_at,
+        "source": source,
         "calibration_version": cal_version,
         "baseline_value": baseline_value,
         "comparison_status": comparison_status,
@@ -267,6 +285,10 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
         "id": insert_id,
         "metric_id": metric_id,
         "metric_name": metric_name,
+        "sample_time": sample_time,
+        "ingested_at": ingested_at,
+        "source": source,
+        "calibration_version": cal_version,
         "snapshot_value": round(current_value, 4),
         "baseline_value": baseline_value,
         "z_score": z_score,
@@ -593,11 +615,74 @@ def compute_retention(task: dict[str, Any]) -> list[dict[str, Any]]:
 # 异常检测管道
 # ============================================================================
 
+def _anomaly_fetch_samples(analysis: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """按归因请求加载用于分析的采样。
+
+    优先使用告警记录里固化的样本区间（``sample_window_start`` ~
+    ``sample_window_end``）与口径版本；没有区间时按异常时间点前后兜底。
+    """
+    from app.alerting import load_samples, parse_time
+
+    metric_id = analysis.get("metric_id")
+    if not metric_id:
+        target_name = analysis.get("分析对象", analysis.get("target_name", ""))
+        metric = db.fetchone(
+            "SELECT * FROM metrics WHERE metric_name=? OR metric_name LIKE ? ORDER BY id LIMIT 1",
+            [target_name, f"%{target_name}%"],
+        )
+        if not metric:
+            return None, []
+        metric_id = metric["id"]
+    else:
+        metric = db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])
+        if not metric:
+            return None, []
+
+    calibration = analysis.get("calibration_version")
+    try:
+        calibration = int(calibration) if calibration is not None else None
+    except (TypeError, ValueError):
+        calibration = None
+
+    # 带时间点的 as_of 采样视图，保证口径与判定当时一致
+    window_start = analysis.get("sample_window_start")
+    window_end = analysis.get("sample_window_end")
+    as_of = window_end or analysis.get("anomaly_time")
+    samples, _ = load_samples(int(metric_id), as_of=as_of, calibration_version=calibration)
+
+    if window_start:
+        samples = [s for s in samples if s["sample_time"] >= str(window_start)]
+    if window_end:
+        samples = [s for s in samples if s["sample_time"] <= str(window_end)]
+
+    evidence_ids = analysis.get("evidence_sample_ids") or []
+    if evidence_ids:
+        by_id = {s["id"]: s for s in samples}
+        missing = [sid for sid in evidence_ids if sid not in by_id]
+        if missing:
+            # 证据采样必须能在库里按原口径取回，取不回就不能声称用到了它
+            for sid in missing:
+                row = db.fetchone("SELECT * FROM metric_values WHERE id=?", [sid])
+                if row and (calibration is None or int(row.get("calibration_version") or 1) == calibration):
+                    sample_time = row.get("sample_time") or row.get("snapshot_time")
+                    by_id[sid] = {
+                        "id": int(row["id"]),
+                        "sample_time": str(sample_time),
+                        "value": float(row.get("snapshot_value") or 0.0),
+                        "calibration_version": int(row.get("calibration_version") or 1),
+                        "source": str(row.get("source") or "live"),
+                        "ingested_at": row.get("ingested_at") or row.get("created_at"),
+                    }
+        samples = [by_id[sid] for sid in evidence_ids if sid in by_id]
+
+    return metric, samples
+
+
 def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
     """对指定指标执行多维度异常检测和归因分析。
 
-    从 metric_values 表获取历史值，计算移动平均和标准差，
-    检测当前值是否超出 3-sigma 范围，并按维度拆解贡献度。
+    以告警记录里的样本区间关联实际采样：区间内的采样用于计算异常幅度，
+    区间之前的同口径采样作为基线。归因结论只描述这批采样。
     """
     target_name = analysis.get("分析对象", analysis.get("target_name", ""))
     anomaly_time = analysis.get("异常时间点", analysis.get("anomaly_time", db.now()))
@@ -608,27 +693,38 @@ def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         dims = []
 
-    # 从 metric_values 读取历史
-    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{target_name}%"])
+    metric, window_samples = _anomaly_fetch_samples(analysis)
     if not metric:
         return {"status": "分析失败", "reason": f"未找到指标: {target_name}"}
 
-    metric_id = metric["id"]
-    all_snapshots = db.fetchall(
-        "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 60",
-        [metric_id],
+    if not window_samples:
+        return {"status": "分析失败", "reason": "样本区间内没有可用的指标采样"}
+
+    metric_id = int(metric["id"])
+    calibration = window_samples[0]["calibration_version"]
+    window_start = window_samples[0]["sample_time"]
+    window_end = window_samples[-1]["sample_time"]
+
+    # 基线：区间之前、同一口径的采样。基线不足时仍按告警证据出结论，
+    # 只是不给出 z-score，并在结论里写明基线情况。
+    baseline_rows = db.fetchall(
+        "SELECT * FROM metric_values WHERE metric_id=? AND calibration_version=? "
+        "AND COALESCE(sample_time, snapshot_time) < ? "
+        "ORDER BY COALESCE(sample_time, snapshot_time) DESC LIMIT 30",
+        [metric_id, calibration, window_start],
     )
+    values = [float(row["snapshot_value"]) for row in baseline_rows]
+    window_values = [sample["value"] for sample in window_samples]
+    observed = statistics.mean(window_values)
 
-    if len(all_snapshots) < 10:
-        return {"status": "分析失败", "reason": "历史数据不足（< 10 条快照）"}
-
-    values = [s["snapshot_value"] for s in all_snapshots]
-    latest = values[0]
-    historical = values[1:]
-    mean_v = statistics.mean(historical)
-    std_v = statistics.stdev(historical) if len(historical) > 1 else 0.0001
-
-    z_score = round((latest - mean_v) / max(std_v, 1e-8), 4)
+    z_score: float | None = None
+    mean_v: float | None = None
+    std_v: float | None = None
+    baseline_sufficient = len(values) >= 5
+    if baseline_sufficient:
+        mean_v = statistics.mean(values)
+        std_v = statistics.stdev(values) if len(values) > 1 else 0.0001
+        z_score = round((observed - mean_v) / max(std_v, 1e-8), 4)
 
     # 按维度归因
     contributions: dict[str, float] = {}
@@ -644,25 +740,47 @@ def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
                 for r in agg_rows:
                     contributions[r["dimension_key"]] = round(r["total"] / total_all, 4)
 
-    conclusion = "未检测到显著异常"
-    if abs(z_score) >= 3:
-        top_contributors = sorted(contributions.items(), key=lambda x: -x[1])[:3]
-        conclusion = f"检测到显著异常(z={z_score})，主要贡献维度: {json.dumps(top_contributors, ensure_ascii=False)}"
+    top_contributors = sorted(contributions.items(), key=lambda x: -x[1])[:3]
+    scope = (
+        f"样本区间 {window_start} ~ {window_end}（口径 v{calibration}，"
+        f"{len(window_samples)} 个采样）均值 {round(observed, 4)}"
+    )
+    if z_score is not None:
+        is_anomaly = abs(z_score) >= 3
+        deviation = f"较基线（{len(values)} 个同口径样本）z={z_score}"
+    else:
+        # 基线不足时，异常与否直接沿用告警的阈值证据：区间内全部采样都超限才算异常。
+        is_anomaly = True
+        deviation = f"基线样本不足（{len(values)} 个，少于 5 个），异常幅度沿用告警超限证据"
 
-    result = {
+    if is_anomaly:
+        conclusion = (
+            f"{scope}，{deviation}，检测到显著异常；主要贡献维度: "
+            f"{json.dumps(top_contributors, ensure_ascii=False)}"
+        )
+    else:
+        conclusion = f"{scope}，{deviation}，未达到显著异常"
+
+    return {
         "target_name": target_name,
         "anomaly_time": anomaly_time,
+        "metric_id": metric_id,
+        "calibration_version": calibration,
+        "sample_window_start": window_start,
+        "sample_window_end": window_end,
+        "evidence_samples": window_samples,
         "z_score": z_score,
-        "is_anomaly": abs(z_score) >= 3,
-        "mean": round(mean_v, 4),
-        "std": round(std_v, 4),
-        "latest_value": latest,
+        "is_anomaly": is_anomaly,
+        "mean": round(mean_v, 4) if mean_v is not None else None,
+        "std": round(std_v, 4) if std_v is not None else None,
+        "latest_value": window_samples[-1]["value"],
+        "window_value": round(observed, 4),
+        "baseline_sample_count": len(values),
+        "baseline_sufficient": baseline_sufficient,
         "contributions": contributions,
         "conclusion": conclusion,
-        "status": "已完成" if abs(z_score) >= 3 else "已完成",
+        "status": "已完成",
     }
-
-    return result
 
 
 # ============================================================================
@@ -1009,83 +1127,15 @@ def precompute_cube(cube: dict[str, Any]) -> int:
 # 告警检查管道
 # ============================================================================
 
-def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
-    """检查告警条件是否触发。
+def check_alert(alert: dict[str, Any], *, as_of: str | None = None) -> dict[str, Any] | None:
+    """检查告警条件是否触发（兼容旧调用，委托给告警判定引擎）。
 
-    从 metric_values 获取最新指标值，对比告警条件判断是否触发，
-    达到连续触发阈值才写入 alert_log。
+    连续次数按指标采样记录计算：同一采样被检查多次只算一次，
+    不同口径的采样不接成同一段。详细判定过程见 app.alerting。
     """
-    alert_id = alert["id"]
-    monitor_metric = alert.get("监控指标", alert.get("monitor_metric", ""))
-    alert_condition = alert.get("告警条件", alert.get("alert_condition", ">"))
-    threshold_raw = alert.get("连续触发次数", alert.get("consecutive_threshold", 3))
-    threshold = int(threshold_raw)
+    from app.alerting import evaluate_alert
 
-    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{monitor_metric}%"])
-    if not metric:
-        return None
-
-    latest = db.fetchone(
-        "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-        [metric["id"]],
-    )
-    if not latest:
-        return None
-
-    current_value = latest["snapshot_value"]
-
-    # 解析告警条件
-    conditions = alert_condition.split(",") if "," in alert_condition else [alert_condition]
-    triggered = False
-    for cond in conditions:
-        cond = cond.strip()
-        if ">" in cond and ">=" not in cond:
-            try:
-                t_val = float(cond.replace(">", "").strip())
-                if current_value > t_val:
-                    triggered = True
-            except ValueError:
-                pass
-        elif "<" in cond and "<=" not in cond:
-            try:
-                t_val = float(cond.replace("<", "").strip())
-                if current_value < t_val:
-                    triggered = True
-            except ValueError:
-                pass
-        elif ">=" in cond:
-            try:
-                t_val = float(cond.replace(">=", "").strip())
-                if current_value >= t_val:
-                    triggered = True
-            except ValueError:
-                pass
-        elif "<=" in cond:
-            try:
-                t_val = float(cond.replace("<=", "").strip())
-                if current_value <= t_val:
-                    triggered = True
-            except ValueError:
-                pass
-
-    if triggered:
-        recent_logs = db.fetchall(
-            "SELECT * FROM alert_log WHERE alert_id=? ORDER BY triggered_at DESC LIMIT ?",
-            [alert_id, threshold],
-        )
-
-        resolved_count = sum(1 for l in recent_logs if l["resolved"] == 1)
-        if len(recent_logs) >= threshold and resolved_count == 0:
-            return {"triggered": True, "message": f"已连续触发{len(recent_logs)}次"}
-
-        log_id = db.insert("alert_log", {
-            "alert_id": alert_id,
-            "metric_value": current_value,
-            "threshold_value": 0,
-        })
-        return {"triggered": False, "log_id": log_id, "message": "已记录，等待连续触发"}
-
-    return {"triggered": False, "message": "未触发"}
+    return evaluate_alert(dict(alert), as_of=as_of)
 
 
 # ============================================================================
@@ -1267,6 +1317,8 @@ def seed_real_data() -> dict[str, int]:
             "alert_condition": cond,
             "notify_channel": ch,
             "consecutive_threshold": thresh,
+            "sample_interval_seconds": 60,
+            "backfill_grace_seconds": 300,
             "status": "已生效",
         })
     counts["alerts"] = len(alerts)

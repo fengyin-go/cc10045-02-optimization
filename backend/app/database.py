@@ -90,6 +90,9 @@ DDL_STATEMENTS = [
         baseline_value REAL,
         comparison_status TEXT DEFAULT '已保存',
         z_score REAL,
+        sample_time TEXT,
+        ingested_at TEXT,
+        source TEXT DEFAULT 'live',
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (metric_id) REFERENCES metrics(id)
     )""",
@@ -197,6 +200,15 @@ DDL_STATEMENTS = [
         contribution_ranking TEXT DEFAULT '{}',
         conclusion TEXT,
         status TEXT NOT NULL DEFAULT '待分析',
+        alert_log_id INTEGER,
+        metric_id INTEGER,
+        calibration_version INTEGER,
+        sample_window_start TEXT,
+        sample_window_end TEXT,
+        evidence_sample_ids TEXT DEFAULT '[]',
+        evidence_json TEXT DEFAULT '[]',
+        evidence_hash TEXT,
+        analysis_inputs TEXT DEFAULT '{}',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
 
@@ -264,6 +276,8 @@ DDL_STATEMENTS = [
         alert_condition TEXT NOT NULL,
         notify_channel TEXT DEFAULT '',
         consecutive_threshold INTEGER NOT NULL DEFAULT 3,
+        sample_interval_seconds INTEGER NOT NULL DEFAULT 60,
+        backfill_grace_seconds INTEGER NOT NULL DEFAULT 300,
         status TEXT NOT NULL DEFAULT '待生效',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
@@ -272,11 +286,57 @@ DDL_STATEMENTS = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         alert_id INTEGER NOT NULL,
         triggered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        metric_id INTEGER,
+        calibration_version INTEGER,
+        sample_time TEXT,
+        window_start TEXT,
+        window_end TEXT,
+        consecutive_count INTEGER DEFAULT 0,
         metric_value REAL,
         threshold_value REAL,
+        sample_ids TEXT DEFAULT '[]',
+        evidence_json TEXT DEFAULT '[]',
+        rule_snapshot TEXT DEFAULT '{}',
+        run_key TEXT,
+        check_id INTEGER,
         resolved INTEGER DEFAULT 0,
         FOREIGN KEY (alert_id) REFERENCES alerts(id)
     )""",
+    "CREATE INDEX IF NOT EXISTS idx_alert_log_rule ON alert_log(alert_id, triggered_at)",
+    """CREATE TABLE IF NOT EXISTS alert_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_log_id INTEGER NOT NULL,
+        metric_value_id INTEGER NOT NULL,
+        sample_time TEXT NOT NULL,
+        sample_value REAL NOT NULL,
+        calibration_version INTEGER NOT NULL DEFAULT 1,
+        position INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (alert_log_id) REFERENCES alert_log(id),
+        FOREIGN KEY (metric_value_id) REFERENCES metric_values(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_alert_evidence_log ON alert_evidence(alert_log_id)",
+
+    """CREATE TABLE IF NOT EXISTS alert_checks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_id INTEGER NOT NULL,
+        checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+        metric_id INTEGER,
+        calibration_version INTEGER,
+        latest_sample_time TEXT,
+        status TEXT,
+        reason TEXT,
+        sample_count INTEGER DEFAULT 0,
+        evaluated_samples TEXT DEFAULT '[]',
+        runs_json TEXT DEFAULT '[]',
+        pending_json TEXT DEFAULT '{}',
+        waiting_json TEXT DEFAULT '[]',
+        pending_sample_time TEXT,
+        grace_deadline TEXT,
+        can_wait INTEGER DEFAULT 0,
+        triggered_log_id INTEGER,
+        FOREIGN KEY (alert_id) REFERENCES alerts(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_alert_checks_rule ON alert_checks(alert_id, checked_at)",
 
     """CREATE TABLE IF NOT EXISTS query_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,6 +416,81 @@ DDL_STATEMENTS = [
 ]
 
 
+COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "metric_values": [
+        ("sample_time", "TEXT"),
+        ("ingested_at", "TEXT"),
+        ("source", "TEXT DEFAULT 'live'"),
+    ],
+    "alerts": [
+        ("sample_interval_seconds", "INTEGER NOT NULL DEFAULT 60"),
+        ("backfill_grace_seconds", "INTEGER NOT NULL DEFAULT 300"),
+    ],
+    "alert_log": [
+        ("metric_id", "INTEGER"),
+        ("calibration_version", "INTEGER"),
+        ("sample_time", "TEXT"),
+        ("window_start", "TEXT"),
+        ("window_end", "TEXT"),
+        ("consecutive_count", "INTEGER DEFAULT 0"),
+        ("sample_ids", "TEXT DEFAULT '[]'"),
+        ("evidence_json", "TEXT DEFAULT '[]'"),
+        ("rule_snapshot", "TEXT DEFAULT '{}'"),
+        ("run_key", "TEXT"),
+        ("check_id", "INTEGER"),
+    ],
+    "alert_checks": [
+        ("runs_json", "TEXT DEFAULT '[]'"),
+        ("pending_json", "TEXT DEFAULT '{}'"),
+        ("waiting_json", "TEXT DEFAULT '[]'"),
+    ],
+    "anomaly_analyses": [
+        ("alert_log_id", "INTEGER"),        ("metric_id", "INTEGER"),
+        ("calibration_version", "INTEGER"),
+        ("sample_window_start", "TEXT"),
+        ("sample_window_end", "TEXT"),
+        ("evidence_sample_ids", "TEXT DEFAULT '[]'"),
+        ("evidence_json", "TEXT DEFAULT '[]'"),
+        ("evidence_hash", "TEXT"),
+        ("analysis_inputs", "TEXT DEFAULT '{}'"),
+    ],
+}
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    """给已有库补列：老版本的库没有样本时刻、口径和证据字段。
+
+    同时把历史上只写 snapshot_time 的采样回填 sample_time，保证按采样时刻
+    判定的逻辑对旧数据同样成立。
+    """
+    for table, columns in COLUMN_MIGRATIONS.items():
+        try:
+            existing = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except sqlite3.Error:
+            continue
+        if not existing:
+            continue
+        for column, ddl in columns:
+            if column not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                except sqlite3.Error:
+                    pass
+    try:
+        conn.execute(
+            "UPDATE metric_values SET sample_time = snapshot_time "
+            "WHERE sample_time IS NULL OR sample_time = ''"
+        )
+        conn.execute(
+            "UPDATE metric_values SET ingested_at = created_at "
+            "WHERE ingested_at IS NULL OR ingested_at = ''"
+        )
+    except sqlite3.Error:
+        pass
+
+
 class AnalyticsDB:
     """SQLite-backed analytics database with connection pooling and WAL mode."""
 
@@ -373,6 +508,7 @@ class AnalyticsDB:
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
             conn.execute(stmt)
+        _migrate_columns(conn)
         conn.commit()
         conn.close()
 

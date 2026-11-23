@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import db
 from app.pipeline import seed_real_data
-from app.routers import ROUTERS, PIPELINE_ROUTER
+from app.routers import ALERTING_ROUTER, ROUTERS, PIPELINE_ROUTER
 from app.store import store
 
 app = FastAPI(title="实时数据分析与可视化应用平台", version="1.0.0")
@@ -51,6 +51,9 @@ def overview() -> dict[str, object]:
 
 # 管道路由：数据分析核心入口
 app.include_router(PIPELINE_ROUTER)
+
+# 告警判定审计与归因证据路由，挂在具体模块名下
+app.include_router(ALERTING_ROUTER)
 
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册
 for module in ROUTERS:

@@ -76,10 +76,20 @@ class BaseModuleService:
             f"SELECT * FROM {table} WHERE {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?",
             params + [size, (page - 1) * size],
         )
-        return rows, total
+        return [self._with_display_fields(row) for row in rows], total
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
-        return db.fetchone(f"SELECT * FROM {self._module_table()} WHERE id=?", [entry_id])
+        row = db.fetchone(f"SELECT * FROM {self._module_table()} WHERE id=?", [entry_id])
+        return self._with_display_fields(row) if row else None
+
+    def _with_display_fields(self, row: dict[str, Any]) -> dict[str, Any]:
+        """补上中文字段别名：页面按模块字段展示，库里存英文列名。"""
+        enriched = dict(row)
+        for field in self.LIST_FIELDS:
+            column = _to_column_name(field)
+            if field not in enriched and column in enriched:
+                enriched[field] = enriched[column]
+        return enriched
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [
@@ -93,10 +103,24 @@ class BaseModuleService:
         data: dict[str, Any] = {}
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
-            data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
+            data[col] = values.get(field, values.get(col, ""))
+        if "name" not in data and self.LIST_FIELDS and _has_column(table, "name"):
             data["name"] = values.get(self.LIST_FIELDS[0], "")
         data["status"] = self.STATUS_ORDER[0]
+
+        # 数值型配置落库时要是整数，后续判定和统计都按数值比较。
+        numeric_fields = (
+            ("consecutive_threshold", 3),
+            ("sample_interval_seconds", 60),
+            ("backfill_grace_seconds", 300),
+        )
+        for col, default in numeric_fields:
+            if col in data or col in values:
+                raw = data.get(col, values.get(col, default))
+                try:
+                    data[col] = int(raw or default)
+                except (TypeError, ValueError):
+                    data[col] = default
 
         entry_id = db.insert(table, data)
         entry = db.fetchone(f"SELECT * FROM {table} WHERE id=?", [entry_id])
@@ -127,6 +151,14 @@ class BaseModuleService:
             "by_status": by_status,
             "abnormal": 0,
         }
+
+
+def _has_column(table: str, column: str) -> bool:
+    try:
+        rows = db.fetchall(f"PRAGMA table_info({table})")
+    except Exception:
+        return False
+    return any(row.get("name") == column for row in rows)
 
 
 def _to_column_name(chinese_field: str) -> str:
